@@ -105,6 +105,24 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIn("- number of paragraphs: 2", captured["prompt"])
         self.assertIn("开头更有悬念", captured["prompt"])
 
+    def test_generate_script_keeps_normal_brackets_when_unwrapping_markdown_links(self):
+        def fake_generate_response(prompt):
+            return (
+                "AI (Artificial Intelligence) helps creators [keep this note].\n\n"
+                "Read [OpenAI](https://openai.com) for details."
+            )
+
+        with patch.object(llm, "_generate_response", side_effect=fake_generate_response):
+            result = llm.generate_script(
+                video_subject="AI",
+                paragraph_number=2,
+            )
+
+        self.assertIn("(Artificial Intelligence)", result)
+        self.assertIn("[keep this note]", result)
+        self.assertIn("Read OpenAI for details.", result)
+        self.assertNotIn("https://openai.com", result)
+
     def test_generate_terms_can_request_script_ordered_keywords(self):
         """
         按文案顺序匹配素材依赖 LLM 返回有序关键词。这里不调用真实模型，
@@ -128,6 +146,27 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertEqual(result, ["opening city", "middle office", "final sunset"])
         self.assertIn("chronological stock-video search terms", captured["prompt"])
         self.assertIn("same order as the script narration", captured["prompt"])
+
+    def test_generate_terms_can_request_people_free_china_context(self):
+        captured = {}
+
+        def fake_generate_response(prompt):
+            captured["prompt"] = prompt
+            return '["city street", "office desk", "food close up"]'
+
+        with patch.object(llm, "_generate_response", side_effect=fake_generate_response):
+            result = llm.generate_terms(
+                video_subject="\u4e0a\u6d77\u4e00\u65e5\u6e38",
+                video_script="\u5750\u5730\u94c1\u53bb\u5403\u706b\u9505",
+                amount=3,
+                material_locale="china",
+                avoid_people=True,
+            )
+
+        self.assertEqual(result, ["city street", "office desk", "food close up"])
+        self.assertIn("prefer non-human B-roll", captured["prompt"])
+        self.assertIn("China-compatible visual context", captured["prompt"])
+        self.assertIn("do not use people", captured["prompt"])
 
     def test_video_script_request_rejects_invalid_advanced_options(self):
         """

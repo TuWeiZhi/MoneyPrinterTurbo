@@ -114,6 +114,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="video material source",
     )
     parser.add_argument(
+        "--video-sources",
+        default=None,
+        help="comma-separated material sources, e.g. local,pixabay,pexels,coverr",
+    )
+    parser.add_argument(
+        "--material-source-mode",
+        default=None,
+        choices=["fallback", "mixed"],
+        help="multi-source material mode",
+    )
+    parser.add_argument(
         "--video-materials",
         default="",
         help="comma-separated local material paths",
@@ -152,6 +163,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         action=argparse.BooleanOptionalAction,
         help="match generated/search materials to script order",
+    )
+    parser.add_argument(
+        "--material-locale",
+        choices=["auto", "global", "china"],
+        default=None,
+        help="stock material locale policy",
+    )
+    parser.add_argument(
+        "--material-people-filter",
+        choices=["auto", "avoid", "allow"],
+        default=None,
+        help="people visibility policy for online stock materials",
     )
     parser.add_argument("--voice-name", default="", help="tts voice name")
     parser.add_argument(
@@ -241,10 +264,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task-id", default="", help="custom task id")
     args = parser.parse_args(argv)
 
-    if args.video_source == "local" and not (args.video_materials or "").strip():
+    selected_sources = []
+    if args.video_sources:
+        selected_sources = [
+            source.strip().lower()
+            for source in args.video_sources.replace("，", ",").split(",")
+            if source.strip()
+        ]
+
+    uses_local_source = args.video_source == "local" or "local" in selected_sources
+    has_online_source = any(
+        source in {"pexels", "pixabay", "coverr"} for source in selected_sources
+    )
+
+    if (
+        uses_local_source
+        and not has_online_source
+        and not (args.video_materials or "").strip()
+    ):
         parser.error("--video-materials is required when --video-source is local")
 
-    if args.video_source == "local" and args.stop_at == "terms":
+    if uses_local_source and not has_online_source and args.stop_at == "terms":
         parser.error(
             "--stop-at terms has no effect with --video-source local "
             "(search terms are not generated for local sources)"
@@ -273,6 +313,8 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
         "video_script": args.video_script,
         "video_terms": video_terms,
         "video_source": args.video_source,
+        "video_sources": args.video_sources,
+        "material_source_mode": args.material_source_mode,
         "video_materials": video_materials,
         "video_count": args.video_count,
         "video_aspect": args.video_aspect,
@@ -289,6 +331,8 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
         "video_transition_mode",
         "video_clip_duration",
         "match_materials_to_script",
+        "material_locale",
+        "material_people_filter",
         "voice_volume",
         "voice_rate",
         "bgm_type",

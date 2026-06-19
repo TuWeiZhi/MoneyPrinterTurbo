@@ -1,5 +1,15 @@
 [app]
-video_source = "pexels" # "pexels" or "pixabay"
+video_source = "pexels" # "pexels", "pixabay", "coverr", or "local"
+video_sources = ["pexels"] # multi-source order, e.g. ["local", "pixabay", "pexels", "coverr"]
+material_source_mode = "fallback" # "fallback" or "mixed"
+
+# Stock material policy:
+# - material_locale: "auto", "global", or "china"
+#   auto detects Chinese/China-related subjects and adjusts search terms.
+# - material_people_filter: "auto", "avoid", or "allow"
+#   auto avoids obvious people/faces for Chinese content to reduce foreign-scene mismatch.
+material_locale = "auto"
+material_people_filter = "auto"
 
 # 是否隐藏配置面板
 hide_config = false

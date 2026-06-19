@@ -8,9 +8,21 @@ from loguru import logger
 from app.config import config
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
-from app.services import llm, material, subtitle, video, voice, upload_post
+from app.services import llm, material, material_policy, subtitle, video, voice, upload_post
 from app.services import state as sm
 from app.utils import file_security, utils
+
+
+def mark_task_failed(task_id: str, message: str, failed_stage: str = ""):
+    current_task = sm.state.get_task(task_id) or {}
+    progress = current_task.get("progress", 0)
+    sm.state.update_task(
+        task_id,
+        state=const.TASK_STATE_FAILED,
+        progress=progress,
+        error_message=message,
+        failed_stage=failed_stage,
+    )
 
 
 def generate_script(task_id, params):
@@ -28,8 +40,9 @@ def generate_script(task_id, params):
         logger.debug(f"video script: \n{video_script}")
 
     if not video_script:
-        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-        logger.error("failed to generate video script.")
+        message = "failed to generate video script."
+        mark_task_failed(task_id, message, "script")
+        logger.error(message)
         return None
 
     return video_script
@@ -38,6 +51,13 @@ def generate_script(task_id, params):
 def generate_terms(task_id, params, video_script):
     logger.info("\n\n## generating video terms")
     video_terms = params.video_terms
+    policy = material_policy.resolve_material_policy(
+        video_language=getattr(params, "video_language", ""),
+        video_subject=getattr(params, "video_subject", ""),
+        video_script=video_script,
+        material_locale=getattr(params, "material_locale", "auto"),
+        people_filter=getattr(params, "material_people_filter", "auto"),
+    )
     if not video_terms:
         # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
         # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
@@ -47,7 +67,15 @@ def generate_terms(task_id, params, video_script):
             video_script=video_script,
             amount=8 if params.match_materials_to_script else 5,
             match_script_order=params.match_materials_to_script,
+            material_locale=(
+                "china" if policy.is_china_context else policy.material_locale
+            ),
+            avoid_people=policy.avoid_people,
         )
+        if isinstance(video_terms, str) and "Error: " in video_terms:
+            mark_task_failed(task_id, video_terms, "terms")
+            logger.error(video_terms)
+            return None
     else:
         if isinstance(video_terms, str):
             video_terms = [term.strip() for term in re.split(r"[,，]", video_terms)]
@@ -58,9 +86,18 @@ def generate_terms(task_id, params, video_script):
 
         logger.debug(f"video terms: {utils.to_json(video_terms)}")
 
+    video_terms = material_policy.adapt_search_terms_for_policy(video_terms, policy)
+    logger.info(
+        "material policy resolved: "
+        f"locale={policy.material_locale}, avoid_people={policy.avoid_people}, "
+        f"is_chinese_content={policy.is_chinese_content}, "
+        f"is_china_context={policy.is_china_context}, reason={policy.reason}"
+    )
+
     if not video_terms:
-        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-        logger.error("failed to generate video terms.")
+        message = "failed to generate video terms."
+        mark_task_failed(task_id, message, "terms")
+        logger.error(message)
         return None
 
     return video_terms
@@ -141,7 +178,7 @@ def generate_audio(task_id, params, video_script):
             "custom audio file is invalid, "
             f"task_id: {task_id}, path: {requested_custom_audio_file}, error: {str(exc)}"
         )
-        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        mark_task_failed(task_id, str(exc), "audio")
         return None, None, None
 
     if not custom_audio_file:
@@ -151,29 +188,31 @@ def generate_audio(task_id, params, video_script):
             text=video_script,
             voice_name=voice.parse_voice_name(params.voice_name),
             voice_rate=params.voice_rate,
+            voice_volume=getattr(params, "voice_volume", 1.0),
             voice_file=audio_file,
         )
         if sub_maker is None:
-            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-            logger.error(
-                """failed to generate audio:
+            message = """failed to generate audio:
 1. check if the language of the voice matches the language of the video script.
 2. check if the network is available. If you are in China, it is recommended to use a VPN and enable the global traffic mode.
             """.strip()
-            )
+            mark_task_failed(task_id, message, "audio")
+            logger.error(message)
             return None, None, None
         audio_duration = math.ceil(voice.get_audio_duration(sub_maker))
         if audio_duration == 0:
-            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-            logger.error("failed to get audio duration.")
+            message = "failed to get audio duration."
+            mark_task_failed(task_id, message, "audio")
+            logger.error(message)
             return None, None, None
         return audio_file, audio_duration, sub_maker
     else:
         logger.info(f"using custom audio file: {custom_audio_file}")
         audio_duration = voice.get_audio_duration(custom_audio_file)
         if audio_duration == 0:
-            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-            logger.error("failed to get audio duration from custom audio file.")
+            message = "failed to get audio duration from custom audio file."
+            mark_task_failed(task_id, message, "audio")
+            logger.error(message)
             return None, None, None
         return custom_audio_file, audio_duration, None
 
@@ -186,12 +225,19 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         - subtitle_path: path to the generated subtitle file
     '''
     logger.info("\n\n## generating subtitle")
-    if not params.subtitle_enabled or sub_maker is None:
+    if not params.subtitle_enabled:
         return ""
 
     subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
     subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
     logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
+
+    if sub_maker is None and subtitle_provider != "whisper":
+        logger.warning(
+            "subtitle maker is unavailable; use subtitle_provider='whisper' "
+            "to generate subtitles from an existing audio file"
+        )
+        return ""
 
     subtitle_fallback = False
     if subtitle_provider == "edge":
@@ -215,21 +261,71 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
+def _get_requested_video_sources(params):
+    sources = getattr(params, "video_sources", None)
+    if sources:
+        if isinstance(sources, str):
+            requested_sources = [
+                source.strip() for source in re.split(r"[,，]", sources)
+            ]
+        else:
+            requested_sources = list(sources)
+    else:
+        requested_sources = [getattr(params, "video_source", "pexels")]
+
+    primary_source = getattr(params, "video_source", "pexels")
+    if primary_source and primary_source not in requested_sources:
+        requested_sources.insert(0, primary_source)
+
+    normalized_sources = []
+    for source in requested_sources:
+        source_name = (source or "").strip().lower()
+        if source_name and source_name not in normalized_sources:
+            normalized_sources.append(source_name)
+    return normalized_sources
+
+
 def get_video_materials(task_id, params, video_terms, audio_duration):
-    if params.video_source == "local":
+    requested_sources = _get_requested_video_sources(params)
+    online_sources = [
+        source for source in requested_sources if source in {"pexels", "pixabay", "coverr"}
+    ]
+    local_requested = "local" in requested_sources
+    source_mode = getattr(params, "material_source_mode", "fallback")
+    source_mode = source_mode if source_mode in {"fallback", "mixed"} else "fallback"
+    required_duration = audio_duration * params.video_count
+    local_video_paths = []
+    local_duration = 0.0
+
+    if local_requested:
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
             materials=params.video_materials, clip_duration=params.video_clip_duration
         )
         if not materials:
-            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-            logger.error(
-                "no valid materials found, please check the materials and try again."
-            )
-            return None
-        return [material_info.url for material_info in materials]
-    else:
-        logger.info(f"\n\n## downloading videos from {params.video_source}")
+            if not online_sources:
+                message = "no valid materials found, please check the materials and try again."
+                mark_task_failed(task_id, message, "materials")
+                logger.error(message)
+                return None
+            logger.warning("no valid local materials found, fallback to online sources")
+        else:
+            local_video_paths = [material_info.url for material_info in materials]
+            local_duration = len(local_video_paths) * params.video_clip_duration
+            if source_mode == "fallback" and local_duration >= required_duration:
+                return local_video_paths
+
+    if online_sources:
+        logger.info(
+            f"\n\n## downloading videos from {online_sources}, mode: {source_mode}"
+        )
+        policy = material_policy.resolve_material_policy(
+            video_language=getattr(params, "video_language", ""),
+            video_subject=getattr(params, "video_subject", ""),
+            video_script=getattr(params, "video_script", ""),
+            material_locale=getattr(params, "material_locale", "auto"),
+            people_filter=getattr(params, "material_people_filter", "auto"),
+        )
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
         # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
         downloaded_videos = material.download_videos(
@@ -242,17 +338,36 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                 if params.match_materials_to_script
                 else params.video_concat_mode
             ),
-            audio_duration=audio_duration * params.video_count,
+            sources=online_sources,
+            source_mode=source_mode,
+            audio_duration=(
+                max(required_duration - local_duration, 0.0)
+                if source_mode == "fallback"
+                else required_duration
+            ),
             max_clip_duration=params.video_clip_duration,
             match_script_order=params.match_materials_to_script,
+            material_locale=(
+                "china" if policy.is_china_context else policy.material_locale
+            ),
+            avoid_people=policy.avoid_people,
         )
         if not downloaded_videos:
-            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-            logger.error(
-                "failed to download videos, maybe the network is not available. if you are in China, please use a VPN."
-            )
+            if local_video_paths:
+                return local_video_paths
+            message = "failed to download videos, maybe the network is not available. if you are in China, please use a VPN."
+            mark_task_failed(task_id, message, "materials")
+            logger.error(message)
             return None
-        return downloaded_videos
+        return local_video_paths + downloaded_videos
+
+    if local_video_paths:
+        return local_video_paths
+
+    message = "please select a valid video source."
+    mark_task_failed(task_id, message, "materials")
+    logger.error(message)
+    return None
 
 
 def generate_final_videos(
@@ -311,14 +426,14 @@ def generate_final_videos(
     return final_video_paths, combined_video_paths
 
 
-def start(task_id, params: VideoParams, stop_at: str = "video"):
+def _start_impl(task_id, params: VideoParams, stop_at: str = "video"):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
 
     # 1. Generate script
     video_script = generate_script(task_id, params)
     if not video_script or "Error: " in video_script:
-        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        mark_task_failed(task_id, "video script generation returned no usable content", "script")
         return
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
@@ -334,7 +449,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     if params.video_source != "local":
         video_terms = generate_terms(task_id, params, video_script)
         if not video_terms:
-            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            mark_task_failed(task_id, "video terms generation returned no usable content", "terms")
             return
 
     save_script_data(task_id, video_script, video_terms, params)
@@ -352,7 +467,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         task_id, params, video_script
     )
     if not audio_file:
-        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        mark_task_failed(task_id, "audio generation returned no usable file", "audio")
         return
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
@@ -387,7 +502,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         task_id, params, video_terms, audio_duration
     )
     if not downloaded_videos:
-        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        mark_task_failed(task_id, "material preparation returned no usable files", "materials")
         return
 
     if stop_at == "materials":
@@ -412,7 +527,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     )
 
     if not final_video_paths:
-        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        mark_task_failed(task_id, "video generation returned no output files", "video")
         return
 
     logger.success(
@@ -449,9 +564,11 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
             )
             cross_post_results.append(result)
             if result.get('success'):
-                logger.info(f"✅ Cross-posted: {video_path}")
+                logger.info(f"Cross-posted: {video_path}")
             else:
-                logger.warning(f"⚠️ Failed to cross-post: {video_path} - {result.get('error', 'Unknown error')}")
+                logger.warning(
+                    f"Failed to cross-post: {video_path} - {result.get('error', 'Unknown error')}"
+                )
 
     kwargs = {
         "videos": final_video_paths,
@@ -468,6 +585,18 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )
     return kwargs
+
+
+def start(task_id, params: VideoParams, stop_at: str = "video"):
+    try:
+        return _start_impl(task_id, params, stop_at)
+    except Exception as exc:
+        message = str(exc) or exc.__class__.__name__
+        logger.exception(
+            f"task failed with unhandled exception, task_id: {task_id}, stop_at: {stop_at}"
+        )
+        mark_task_failed(task_id, message, stop_at or "task")
+        return None
 
 
 if __name__ == "__main__":

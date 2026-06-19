@@ -4,6 +4,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import types
 from contextlib import redirect_stdout
 from io import StringIO
@@ -17,9 +19,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from app.config import config
 from app.controllers.manager.base_manager import TaskQueueFullError
 from app.controllers.manager.memory_manager import InMemoryTaskManager
+from app.controllers.manager.redis_manager import RedisTaskManager
 from app.controllers.v1 import video as video_controller
 from app.models import const
-from app.models.schema import MaterialInfo
+from app.models.schema import AudioRequest, MaterialInfo, SubtitleRequest
 from app.services import state as sm
 from app.services import video as vd
 from app.utils import utils
@@ -78,6 +81,52 @@ class TestSecurityControls(unittest.TestCase):
 
         with self.assertRaises(TaskQueueFullError):
             manager.add_task(lambda: None)
+
+    def test_task_manager_reserves_concurrency_slot_before_thread_runs(self):
+        manager = InMemoryTaskManager(max_concurrent_tasks=1, max_queued_tasks=1)
+        release_first = threading.Event()
+        second_started = threading.Event()
+
+        def first_task():
+            release_first.wait(timeout=2)
+
+        def second_task():
+            second_started.set()
+
+        manager.add_task(first_task)
+        manager.add_task(second_task)
+
+        self.assertEqual(manager.current_tasks, 1)
+        self.assertEqual(manager.queue_size(), 1)
+        self.assertFalse(second_started.is_set())
+
+        release_first.set()
+        deadline = time.time() + 2
+        while time.time() < deadline and not second_started.is_set():
+            time.sleep(0.01)
+
+        self.assertTrue(second_started.is_set())
+
+    def test_redis_task_manager_restores_subtitle_and_audio_models(self):
+        subtitle_kwargs = RedisTaskManager._serialize_kwargs(
+            {
+                "params": SubtitleRequest(video_script="hello"),
+                "stop_at": "subtitle",
+            }
+        )
+        audio_kwargs = RedisTaskManager._serialize_kwargs(
+            {
+                "params": AudioRequest(video_script="hello"),
+                "stop_at": "audio",
+            }
+        )
+
+        restored_subtitle = RedisTaskManager._restore_kwargs(subtitle_kwargs)
+        restored_audio = RedisTaskManager._restore_kwargs(audio_kwargs)
+
+        self.assertIsInstance(restored_subtitle["params"], SubtitleRequest)
+        self.assertIsInstance(restored_audio["params"], AudioRequest)
+        self.assertTrue(restored_subtitle["params"].subtitle_enabled)
 
 class TestVideoService(unittest.TestCase):
     def setUp(self):
@@ -430,15 +479,13 @@ class TestVideoService(unittest.TestCase):
             audio_file = os.path.join(temp_dir, "audio.mp3")
 
             with patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()):
-                # Use empty video_paths to avoid heavy video processing while
-                # still exercising transition mode normalization logic.
-                result = vd.combine_videos(
-                    combined_video_path=combined_video_path,
-                    video_paths=[],
-                    audio_file=audio_file,
-                    video_transition_mode=None,
-                )
-                self.assertEqual(result, combined_video_path)
+                with self.assertRaisesRegex(ValueError, "no clips available"):
+                    vd.combine_videos(
+                        combined_video_path=combined_video_path,
+                        video_paths=[],
+                        audio_file=audio_file,
+                        video_transition_mode=None,
+                    )
 
     def test_prioritize_unique_source_clips_uses_each_source_before_reuse(self):
         """

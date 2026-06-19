@@ -87,6 +87,28 @@ class TestSubtitleService(unittest.TestCase):
 
         self.assertEqual([item[2] for item in items], ["Hello", "World"])
 
+    def test_correct_estimates_time_for_extra_script_lines(self):
+        original_srt = (
+            "1\n"
+            "00:00:00,000 --> 00:00:01,500\n"
+            "Hello\n\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            subtitle_file.write_text(original_srt, encoding="utf-8")
+
+            subtitle.correct(
+                subtitle_file=str(subtitle_file),
+                video_script="Hello. Extra line.",
+            )
+
+            corrected_srt = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertIn("Extra line", corrected_srt)
+        self.assertNotIn("00:00:00,000 --> 00:00:00,000", corrected_srt)
+        self.assertIn("00:00:01,500 --> 00:00:03,000", corrected_srt)
+
 
 if __name__ == "__main__":
     unittest.main()

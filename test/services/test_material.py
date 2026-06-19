@@ -92,7 +92,11 @@ class TestMaterialTlsVerification(unittest.TestCase):
         config.app.pop("tls_verify", None)
         config.proxy.clear()
 
-        fake_response = SimpleNamespace(content=b"fake-video")
+        fake_response = SimpleNamespace(
+            content=b"fake-video",
+            headers={"Content-Type": "video/mp4"},
+            raise_for_status=lambda: None,
+        )
 
         class FakeVideoFileClip:
             duration = 1
@@ -114,6 +118,62 @@ class TestMaterialTlsVerification(unittest.TestCase):
 
             self.assertTrue(os.path.exists(video_path))
             self.assertTrue(get.call_args.kwargs["verify"])
+
+    def test_save_video_rejects_error_response_content_type(self):
+        config.app.pop("tls_verify", None)
+        config.proxy.clear()
+
+        fake_response = SimpleNamespace(
+            content=b'{"error": "rate limited"}',
+            headers={"Content-Type": "application/json"},
+            raise_for_status=lambda: None,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch(
+                "app.services.material.requests.get", return_value=fake_response
+            ):
+                video_path = material.save_video(
+                    "https://example.com/video.mp4?token=abc", save_dir=temp_dir
+                )
+
+            self.assertEqual(video_path, "")
+            self.assertEqual(os.listdir(temp_dir), [])
+
+    def test_save_video_cache_key_includes_query_string(self):
+        config.app.pop("tls_verify", None)
+        config.proxy.clear()
+
+        fake_response = SimpleNamespace(
+            content=b"fake-video",
+            headers={"Content-Type": "video/mp4"},
+            raise_for_status=lambda: None,
+        )
+
+        class FakeVideoFileClip:
+            duration = 1
+            fps = 24
+
+            def __init__(self, path):
+                self.path = path
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch(
+                "app.services.material.requests.get", return_value=fake_response
+            ), patch("app.services.material.VideoFileClip", FakeVideoFileClip):
+                first_path = material.save_video(
+                    "https://example.com/video.mp4?token=abc", save_dir=temp_dir
+                )
+                second_path = material.save_video(
+                    "https://example.com/video.mp4?token=def", save_dir=temp_dir
+                )
+
+            self.assertNotEqual(first_path, second_path)
+            self.assertTrue(os.path.exists(first_path))
+            self.assertTrue(os.path.exists(second_path))
 
     def test_download_videos_accepts_plain_string_concat_mode(self):
         """
@@ -177,6 +237,155 @@ class TestMaterialTlsVerification(unittest.TestCase):
             ],
         )
         self.assertEqual(result, ["/tmp/a1.mp4", "/tmp/b1.mp4", "/tmp/a2.mp4"])
+
+    def test_download_videos_adapts_people_terms_when_requested(self):
+        searched_terms = []
+
+        def fake_search(search_term, minimum_duration, video_aspect):
+            searched_terms.append(search_term)
+            return []
+
+        with patch.object(material, "search_videos_pexels", side_effect=fake_search):
+            result = material.download_videos(
+                task_id="avoid-people-materials",
+                search_terms=["businessman office", "city skyline"],
+                source="pexels",
+                avoid_people=True,
+            )
+
+        self.assertEqual(result, [])
+        self.assertEqual(
+            searched_terms,
+            ["office desk no people", "city skyline no people"],
+        )
+
+    def test_download_videos_fallback_uses_china_source_priority(self):
+        searched_sources = []
+
+        def fake_pixabay(search_term, minimum_duration, video_aspect):
+            searched_sources.append("pixabay")
+            return [
+                material.MaterialInfo(
+                    provider="pixabay",
+                    url="https://v.example/pixabay.mp4",
+                    duration=5,
+                )
+            ]
+
+        def fake_pexels(search_term, minimum_duration, video_aspect):
+            searched_sources.append("pexels")
+            return [
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/pexels.mp4",
+                    duration=5,
+                )
+            ]
+
+        with (
+            patch.object(material, "search_videos_pixabay", side_effect=fake_pixabay),
+            patch.object(material, "search_videos_pexels", side_effect=fake_pexels),
+            patch.object(material, "save_video", return_value="/tmp/pixabay.mp4"),
+        ):
+            result = material.download_videos(
+                task_id="china-source-priority",
+                search_terms=["city street"],
+                sources=["pexels", "pixabay"],
+                material_locale="china",
+                audio_duration=4,
+                max_clip_duration=5,
+                video_concat_mode="sequential",
+            )
+
+        self.assertEqual(searched_sources, ["pixabay"])
+        self.assertEqual(result, ["/tmp/pixabay.mp4"])
+
+    def test_download_videos_fallback_continues_to_next_source_when_empty(self):
+        searched_sources = []
+
+        def fake_pixabay(search_term, minimum_duration, video_aspect):
+            searched_sources.append("pixabay")
+            return []
+
+        def fake_pexels(search_term, minimum_duration, video_aspect):
+            searched_sources.append("pexels")
+            return [
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/pexels.mp4",
+                    duration=5,
+                )
+            ]
+
+        with (
+            patch.object(material, "search_videos_pixabay", side_effect=fake_pixabay),
+            patch.object(material, "search_videos_pexels", side_effect=fake_pexels),
+            patch.object(material, "save_video", return_value="/tmp/pexels.mp4"),
+        ):
+            result = material.download_videos(
+                task_id="fallback-next-source",
+                search_terms=["city street"],
+                sources=["pixabay", "pexels"],
+                source_mode="fallback",
+                material_locale="china",
+                audio_duration=4,
+                max_clip_duration=5,
+                video_concat_mode="sequential",
+            )
+
+        self.assertEqual(searched_sources, ["pixabay", "pexels"])
+        self.assertEqual(result, ["/tmp/pexels.mp4"])
+
+    def test_download_videos_mixed_merges_sources_and_deduplicates_urls(self):
+        saved_urls = []
+
+        def fake_pexels(search_term, minimum_duration, video_aspect):
+            return [
+                material.MaterialInfo(
+                    provider="pexels",
+                    url="https://v.example/shared.mp4",
+                    duration=5,
+                )
+            ]
+
+        def fake_pixabay(search_term, minimum_duration, video_aspect):
+            return [
+                material.MaterialInfo(
+                    provider="pixabay",
+                    url="https://v.example/shared.mp4",
+                    duration=5,
+                ),
+                material.MaterialInfo(
+                    provider="pixabay",
+                    url="https://v.example/pixabay.mp4",
+                    duration=5,
+                ),
+            ]
+
+        def fake_save_video(video_url, save_dir=""):
+            saved_urls.append(video_url)
+            return f"/tmp/{video_url.rsplit('/', 1)[-1]}"
+
+        with (
+            patch.object(material, "search_videos_pexels", side_effect=fake_pexels),
+            patch.object(material, "search_videos_pixabay", side_effect=fake_pixabay),
+            patch.object(material, "save_video", side_effect=fake_save_video),
+        ):
+            result = material.download_videos(
+                task_id="mixed-source-dedupe",
+                search_terms=["city street"],
+                sources=["pexels", "pixabay"],
+                source_mode="mixed",
+                audio_duration=9,
+                max_clip_duration=5,
+                video_concat_mode="sequential",
+            )
+
+        self.assertEqual(
+            saved_urls,
+            ["https://v.example/shared.mp4", "https://v.example/pixabay.mp4"],
+        )
+        self.assertEqual(result, ["/tmp/shared.mp4", "/tmp/pixabay.mp4"])
 
 
 class TestCoverrProvider(unittest.TestCase):

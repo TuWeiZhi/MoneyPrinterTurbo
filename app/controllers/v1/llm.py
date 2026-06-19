@@ -9,7 +9,7 @@ from app.models.schema import (
     VideoTermsRequest,
     VideoTermsResponse,
 )
-from app.services import llm
+from app.services import llm, material_policy
 from app.utils import utils
 
 # authentication dependency
@@ -40,10 +40,25 @@ def generate_video_script(request: Request, body: VideoScriptRequest):
     summary="Generate video terms based on the video script",
 )
 def generate_video_terms(request: Request, body: VideoTermsRequest):
+    policy = material_policy.resolve_material_policy(
+        video_language=body.video_language,
+        video_subject=body.video_subject,
+        video_script=body.video_script,
+        material_locale=body.material_locale,
+        people_filter=body.material_people_filter,
+    )
     video_terms = llm.generate_terms(
         video_subject=body.video_subject,
         video_script=body.video_script,
         amount=body.amount,
+        match_script_order=body.match_script_order,
+        material_locale=(
+            "china" if policy.is_china_context else policy.material_locale
+        ),
+        avoid_people=policy.avoid_people,
+    )
+    video_terms = material_policy.adapt_search_terms_for_policy(
+        video_terms, policy
     )
     response = {"video_terms": video_terms}
     return utils.get_response(200, response)

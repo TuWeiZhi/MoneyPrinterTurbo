@@ -298,6 +298,12 @@ def generate_silent_audio(duration_seconds: float, output_file: str) -> bool:
     return True
 
 
+def ensure_audio_output_dir(audio_file: str) -> None:
+    output_dir = os.path.dirname(audio_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+
 def tts(
     text: str,
     voice_name: str,
@@ -305,6 +311,7 @@ def tts(
     voice_file: str,
     voice_volume: float = 1.0,
 ) -> Union[SubMaker, None]:
+    ensure_audio_output_dir(voice_file)
     if is_no_voice(voice_name):
         duration_seconds = estimate_no_voice_duration(text)
         if not generate_silent_audio(duration_seconds, voice_file):
@@ -949,6 +956,7 @@ def gemini_tts(
     _configure_pydub_ffmpeg(AudioSegment)
     
     try:
+        ensure_audio_output_dir(voice_file)
         # 配置Gemini API
         api_key = config.app.get("gemini_api_key", "")
         if not api_key:
@@ -1019,7 +1027,9 @@ def gemini_tts(
             return None
         
         # 导出为MP3格式
-        audio_segment.export(voice_file, format="mp3")
+        exported_audio = audio_segment.export(voice_file, format="mp3")
+        if hasattr(exported_audio, "close"):
+            exported_audio.close()
         
         logger.info(f"completed, output file: {voice_file}")
         

@@ -70,6 +70,42 @@ class TestCli(unittest.TestCase):
         params = cli.build_video_params(args)
         self.assertEqual(params.video_source, "coverr")
 
+    def test_build_video_params_with_multi_source_options(self):
+        args = cli.parse_args(
+            [
+                "--video-subject",
+                "test",
+                "--video-source",
+                "pixabay",
+                "--video-sources",
+                "local,pixabay,pexels",
+                "--material-source-mode",
+                "mixed",
+            ]
+        )
+
+        params = cli.build_video_params(args)
+
+        self.assertEqual(params.video_source, "pixabay")
+        self.assertEqual(params.video_sources, ["local", "pixabay", "pexels"])
+        self.assertEqual(params.material_source_mode, "mixed")
+
+    def test_local_primary_source_can_fallback_to_online_without_materials(self):
+        args = cli.parse_args(
+            [
+                "--video-subject",
+                "test",
+                "--video-source",
+                "local",
+                "--video-sources",
+                "local,pixabay",
+            ]
+        )
+        params = cli.build_video_params(args)
+
+        self.assertEqual(params.video_source, "local")
+        self.assertEqual(params.video_sources, ["local", "pixabay"])
+
     def test_build_video_params_with_script_video_and_audio_options(self):
         args = cli.parse_args(
             [
@@ -90,6 +126,10 @@ class TestCli(unittest.TestCase):
                 "--video-clip-duration",
                 "4",
                 "--match-materials-to-script",
+                "--material-locale",
+                "china",
+                "--material-people-filter",
+                "avoid",
                 "--voice-volume",
                 "1.2",
                 "--voice-rate",
@@ -113,6 +153,8 @@ class TestCli(unittest.TestCase):
         self.assertEqual(params.video_transition_mode, "FadeIn")
         self.assertEqual(params.video_clip_duration, 4)
         self.assertTrue(params.match_materials_to_script)
+        self.assertEqual(params.material_locale, "china")
+        self.assertEqual(params.material_people_filter, "avoid")
         self.assertEqual(params.voice_volume, 1.2)
         self.assertEqual(params.voice_rate, 1.1)
         self.assertEqual(params.bgm_type, "custom")

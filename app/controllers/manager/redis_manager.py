@@ -1,15 +1,29 @@
 import json
 from typing import Dict
 
+from pydantic import BaseModel
 import redis
 
 from app.controllers.manager.base_manager import TaskManager
-from app.models.schema import VideoParams
+from app.models.schema import AudioRequest, SubtitleRequest, TaskVideoRequest, VideoParams
 from app.services import task as tm
 
 FUNC_MAP = {
     "start": tm.start,
     # 'start_test': tm.start_test
+}
+
+PARAM_MODEL_MAP = {
+    "VideoParams": VideoParams,
+    "TaskVideoRequest": TaskVideoRequest,
+    "SubtitleRequest": SubtitleRequest,
+    "AudioRequest": AudioRequest,
+}
+
+STOP_AT_MODEL_MAP = {
+    "video": TaskVideoRequest,
+    "subtitle": SubtitleRequest,
+    "audio": AudioRequest,
 }
 
 
@@ -26,15 +40,32 @@ class RedisTaskManager(TaskManager):
     def create_queue(self):
         return "task_queue"
 
+    @staticmethod
+    def _serialize_kwargs(kwargs: Dict) -> Dict:
+        serializable_kwargs = kwargs.copy()
+        params = serializable_kwargs.get("params")
+        if isinstance(params, BaseModel):
+            serializable_kwargs["params"] = params.model_dump(mode="json")
+            serializable_kwargs["_params_model"] = params.__class__.__name__
+        return serializable_kwargs
+
+    @staticmethod
+    def _restore_kwargs(kwargs: Dict) -> Dict:
+        restored_kwargs = kwargs.copy()
+        params_model_name = restored_kwargs.pop("_params_model", "")
+        params = restored_kwargs.get("params")
+        if isinstance(params, dict):
+            model_cls = PARAM_MODEL_MAP.get(params_model_name)
+            if model_cls is None:
+                model_cls = STOP_AT_MODEL_MAP.get(restored_kwargs.get("stop_at"), VideoParams)
+            restored_kwargs["params"] = model_cls(**params)
+        return restored_kwargs
+
     def enqueue(self, task: Dict):
         task_with_serializable_params = task.copy()
-
-        if "params" in task["kwargs"] and isinstance(
-            task["kwargs"]["params"], VideoParams
-        ):
-            task_with_serializable_params["kwargs"]["params"] = task["kwargs"][
-                "params"
-            ].dict()
+        task_with_serializable_params["kwargs"] = self._serialize_kwargs(
+            task.get("kwargs", {})
+        )
 
         # 将函数对象转换为其名称
         task_with_serializable_params["func"] = task["func"].__name__
@@ -47,12 +78,7 @@ class RedisTaskManager(TaskManager):
             # 将函数名称转换回函数对象
             task_info["func"] = FUNC_MAP[task_info["func"]]
 
-            if "params" in task_info["kwargs"] and isinstance(
-                task_info["kwargs"]["params"], dict
-            ):
-                task_info["kwargs"]["params"] = VideoParams(
-                    **task_info["kwargs"]["params"]
-                )
+            task_info["kwargs"] = self._restore_kwargs(task_info.get("kwargs", {}))
 
             return task_info
         return None

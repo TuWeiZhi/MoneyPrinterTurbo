@@ -10,11 +10,16 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
+from app.services import material_policy
 from app.utils import utils
 
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
+
+ONLINE_VIDEO_SOURCES = ("pexels", "pixabay", "coverr")
+GLOBAL_SOURCE_PRIORITY = ("pexels", "pixabay", "coverr")
+CHINA_SOURCE_PRIORITY = ("pixabay", "pexels", "coverr")
 
 
 def _get_tls_verify() -> bool:
@@ -248,8 +253,7 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    url_without_query = video_url.split("?")[0]
-    url_hash = utils.md5(url_without_query)
+    url_hash = utils.md5(video_url)
     video_id = f"vid-{url_hash}"
     video_path = f"{save_dir}/{video_id}.mp4"
 
@@ -262,17 +266,33 @@ def save_video(video_url: str, save_dir: str = "") -> str:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
 
+    response = requests.get(
+        video_url,
+        headers=headers,
+        proxies=config.proxy,
+        verify=_get_tls_verify(),
+        timeout=(60, 240),
+    )
+    if hasattr(response, "raise_for_status"):
+        response.raise_for_status()
+
+    content_type = ""
+    if hasattr(response, "headers"):
+        content_type = response.headers.get("Content-Type", "").lower()
+    if content_type.startswith(("text/", "application/json")):
+        logger.error(
+            f"downloaded response is not a video, url: {video_url}, content-type: {content_type}"
+        )
+        return ""
+
+    content = getattr(response, "content", b"")
+    if not content:
+        logger.error(f"downloaded empty video response, url: {video_url}")
+        return ""
+
     # if video does not exist, download it
     with open(video_path, "wb") as f:
-        f.write(
-            requests.get(
-                video_url,
-                headers=headers,
-                proxies=config.proxy,
-                verify=_get_tls_verify(),
-                timeout=(60, 240),
-            ).content
-        )
+        f.write(content)
 
     if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
         clip = None
@@ -301,41 +321,63 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     return ""
 
 
-def download_videos(
-    task_id: str,
-    search_terms: List[str],
-    source: str = "pexels",
-    video_aspect: VideoAspect = VideoAspect.portrait,
-    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
-    audio_duration: float = 0.0,
-    max_clip_duration: int = 5,
-    match_script_order: bool = False,
-) -> List[str]:
-    search_videos = search_videos_pexels
+def _get_search_videos(source: str):
     if source == "pixabay":
-        search_videos = search_videos_pixabay
-    elif source == "coverr":
-        search_videos = search_videos_coverr
+        return search_videos_pixabay
+    if source == "coverr":
+        return search_videos_coverr
+    return search_videos_pexels
 
-    material_directory = config.app.get("material_directory", "").strip()
-    if material_directory == "task":
-        material_directory = utils.task_dir(task_id)
-    elif material_directory and not os.path.isdir(material_directory):
-        material_directory = ""
 
-    if match_script_order:
-        return _download_videos_by_script_order(
-            task_id=task_id,
-            search_terms=search_terms,
-            search_videos=search_videos,
-            video_aspect=video_aspect,
-            audio_duration=audio_duration,
-            max_clip_duration=max_clip_duration,
-            material_directory=material_directory,
-        )
+def _normalize_online_sources(
+    source: str = "pexels",
+    sources: List[str] | str | None = None,
+    material_locale: str = "auto",
+) -> List[str]:
+    if sources is None:
+        raw_sources = [source]
+    elif isinstance(sources, str):
+        raw_sources = [item.strip() for item in sources.replace("，", ",").split(",")]
+    else:
+        raw_sources = list(sources)
 
+    selected_sources = []
+    for item in raw_sources:
+        normalized = (item or "").strip().lower()
+        if normalized == "local":
+            continue
+        if normalized in ONLINE_VIDEO_SOURCES and normalized not in selected_sources:
+            selected_sources.append(normalized)
+
+    if not selected_sources:
+        fallback_source = (source or "pexels").strip().lower()
+        selected_sources = [
+            fallback_source if fallback_source in ONLINE_VIDEO_SOURCES else "pexels"
+        ]
+
+    priority = (
+        CHINA_SOURCE_PRIORITY
+        if material_locale == "china"
+        else GLOBAL_SOURCE_PRIORITY
+    )
+    return sorted(
+        selected_sources,
+        key=lambda item: priority.index(item) if item in priority else len(priority),
+    )
+
+
+def _search_video_items(
+    *,
+    source: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    max_clip_duration: int,
+    seen_urls: set[str] | None = None,
+) -> tuple[List[MaterialInfo], float]:
+    search_videos = _get_search_videos(source)
+    if seen_urls is None:
+        seen_urls = set()
     valid_video_items = []
-    valid_video_urls = []
     found_duration = 0.0
     for search_term in search_terms:
         video_items = search_videos(
@@ -343,25 +385,28 @@ def download_videos(
             minimum_duration=max_clip_duration,
             video_aspect=video_aspect,
         )
-        logger.info(f"found {len(video_items)} videos for '{search_term}'")
+        logger.info(f"found {len(video_items)} videos from {source} for '{search_term}'")
 
         for item in video_items:
-            if item.url not in valid_video_urls:
-                valid_video_items.append(item)
-                valid_video_urls.append(item.url)
-                found_duration += item.duration
+            if item.url in seen_urls:
+                continue
+            valid_video_items.append(item)
+            seen_urls.add(item.url)
+            found_duration += item.duration
+    return valid_video_items, found_duration
 
-    logger.info(
-        f"found total videos: {len(valid_video_items)}, required duration: {audio_duration} seconds, found duration: {found_duration} seconds"
-    )
+
+def _download_video_items(
+    *,
+    video_items: List[MaterialInfo],
+    material_directory: str,
+    max_clip_duration: int,
+    audio_duration: float,
+    existing_duration: float = 0.0,
+) -> tuple[List[str], float]:
     video_paths = []
-
-    concat_mode_value = getattr(video_concat_mode, "value", video_concat_mode)
-    if concat_mode_value == VideoConcatMode.random.value:
-        random.shuffle(valid_video_items)
-
-    total_duration = 0.0
-    for item in valid_video_items:
+    total_duration = existing_duration
+    for item in video_items:
         try:
             logger.info(f"downloading video: {item.url}")
             saved_video_path = save_video(
@@ -370,8 +415,7 @@ def download_videos(
             if saved_video_path:
                 logger.info(f"video saved: {saved_video_path}")
                 video_paths.append(saved_video_path)
-                seconds = min(max_clip_duration, item.duration)
-                total_duration += seconds
+                total_duration += min(max_clip_duration, item.duration)
                 if total_duration > audio_duration:
                     logger.info(
                         f"total duration of downloaded videos: {total_duration} seconds, skip downloading more"
@@ -379,6 +423,165 @@ def download_videos(
                     break
         except Exception as e:
             logger.error(f"failed to download video: {utils.to_json(item)} => {str(e)}")
+    return video_paths, total_duration
+
+
+def _make_multi_source_searcher(sources: List[str]):
+    def search_videos(search_term: str, minimum_duration: int, video_aspect: VideoAspect):
+        merged_items = []
+        seen_urls = set()
+        for source in sources:
+            source_items = _get_search_videos(source)(
+                search_term=search_term,
+                minimum_duration=minimum_duration,
+                video_aspect=video_aspect,
+            )
+            logger.info(
+                f"found {len(source_items)} videos from {source} for '{search_term}'"
+            )
+            for item in source_items:
+                if item.url in seen_urls:
+                    continue
+                merged_items.append(item)
+                seen_urls.add(item.url)
+        return merged_items
+
+    return search_videos
+
+
+def download_videos(
+    task_id: str,
+    search_terms: List[str],
+    source: str = "pexels",
+    sources: List[str] | str | None = None,
+    source_mode: str = "fallback",
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
+    audio_duration: float = 0.0,
+    max_clip_duration: int = 5,
+    match_script_order: bool = False,
+    material_locale: str = "auto",
+    avoid_people: bool = False,
+) -> List[str]:
+    material_directory = config.app.get("material_directory", "").strip()
+    if material_directory == "task":
+        material_directory = utils.task_dir(task_id)
+    elif material_directory and not os.path.isdir(material_directory):
+        material_directory = ""
+
+    policy = material_policy.MaterialPolicy(
+        material_locale=material_policy.normalize_material_locale(material_locale),
+        people_filter="avoid" if avoid_people else "allow",
+        avoid_people=avoid_people,
+        is_chinese_content=False,
+        is_china_context=material_locale == "china",
+        reason="download_videos",
+    )
+    search_terms = material_policy.adapt_search_terms_for_policy(search_terms, policy)
+    if avoid_people:
+        logger.info(
+            f"adapted material search terms for people-free stock footage: {search_terms}"
+        )
+
+    source_mode = source_mode if source_mode in {"fallback", "mixed"} else "fallback"
+    source_names = _normalize_online_sources(
+        source=source,
+        sources=sources,
+        material_locale=policy.material_locale,
+    )
+    logger.info(
+        f"using online material sources: {source_names}, mode: {source_mode}"
+    )
+
+    if match_script_order:
+        if source_mode == "fallback":
+            video_paths = []
+            total_downloaded_duration = 0.0
+            for source_name in source_names:
+                source_paths, total_downloaded_duration = _download_videos_by_script_order(
+                    task_id=task_id,
+                    search_terms=search_terms,
+                    search_videos=_get_search_videos(source_name),
+                    video_aspect=video_aspect,
+                    audio_duration=audio_duration,
+                    max_clip_duration=max_clip_duration,
+                    material_directory=material_directory,
+                    source_label=source_name,
+                    existing_duration=total_downloaded_duration,
+                )
+                video_paths.extend(source_paths)
+                if total_downloaded_duration > audio_duration:
+                    return video_paths
+            return video_paths
+
+        video_paths, _ = _download_videos_by_script_order(
+            task_id=task_id,
+            search_terms=search_terms,
+            search_videos=_make_multi_source_searcher(source_names),
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+            source_label="mixed",
+        )
+        return video_paths
+
+    seen_urls = set()
+    total_found_duration = 0.0
+    total_downloaded_duration = 0.0
+    video_paths = []
+
+    if source_mode == "mixed":
+        valid_video_items = []
+        for source_name in source_names:
+            source_items, found_duration = _search_video_items(
+                source=source_name,
+                search_terms=search_terms,
+                video_aspect=video_aspect,
+                max_clip_duration=max_clip_duration,
+                seen_urls=seen_urls,
+            )
+            valid_video_items.extend(source_items)
+            total_found_duration += found_duration
+        logger.info(
+            f"found total videos: {len(valid_video_items)}, required duration: {audio_duration} seconds, found duration: {total_found_duration} seconds"
+        )
+        concat_mode_value = getattr(video_concat_mode, "value", video_concat_mode)
+        if concat_mode_value == VideoConcatMode.random.value:
+            random.shuffle(valid_video_items)
+        video_paths, total_downloaded_duration = _download_video_items(
+            video_items=valid_video_items,
+            material_directory=material_directory,
+            max_clip_duration=max_clip_duration,
+            audio_duration=audio_duration,
+        )
+    else:
+        for source_name in source_names:
+            source_items, found_duration = _search_video_items(
+                source=source_name,
+                search_terms=search_terms,
+                video_aspect=video_aspect,
+                max_clip_duration=max_clip_duration,
+                seen_urls=seen_urls,
+            )
+            total_found_duration += found_duration
+            logger.info(
+                f"found total videos from {source_name}: {len(source_items)}, required duration: {audio_duration} seconds, found duration: {found_duration} seconds"
+            )
+            concat_mode_value = getattr(video_concat_mode, "value", video_concat_mode)
+            if concat_mode_value == VideoConcatMode.random.value:
+                random.shuffle(source_items)
+            source_paths, total_downloaded_duration = _download_video_items(
+                video_items=source_items,
+                material_directory=material_directory,
+                max_clip_duration=max_clip_duration,
+                audio_duration=audio_duration,
+                existing_duration=total_downloaded_duration,
+            )
+            video_paths.extend(source_paths)
+            if total_downloaded_duration > audio_duration:
+                break
+
     logger.success(f"downloaded {len(video_paths)} videos")
     return video_paths
 
@@ -391,7 +594,9 @@ def _download_videos_by_script_order(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
-) -> List[str]:
+    source_label: str = "",
+    existing_duration: float = 0.0,
+) -> tuple[List[str], float]:
     """
     按脚本文案顺序下载素材。
 
@@ -412,7 +617,10 @@ def _download_videos_by_script_order(
             minimum_duration=max_clip_duration,
             video_aspect=video_aspect,
         )
-        logger.info(f"found {len(video_items)} videos for '{search_term}'")
+        logger.info(
+            f"found {len(video_items)} videos"
+            f"{f' from {source_label}' if source_label else ''} for '{search_term}'"
+        )
 
         term_items = []
         for item in video_items:
@@ -431,7 +639,7 @@ def _download_videos_by_script_order(
     )
 
     video_paths = []
-    total_duration = 0.0
+    total_duration = existing_duration
     candidate_index = 0
     while candidate_groups and total_duration <= audio_duration:
         has_candidate = False
@@ -467,7 +675,7 @@ def _download_videos_by_script_order(
         candidate_index += 1
 
     logger.success(f"downloaded {len(video_paths)} ordered videos")
-    return video_paths
+    return video_paths, total_duration
 
 
 if __name__ == "__main__":

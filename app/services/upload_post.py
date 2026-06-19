@@ -83,7 +83,9 @@ class UploadPostService:
                 result = response.json()
 
                 if result.get('success'):
-                    logger.info(f"✅ Video cross-posted successfully! Request ID: {result.get('request_id')}")
+                    logger.info(
+                        f"Video cross-posted successfully. Request ID: {result.get('request_id')}"
+                    )
                 else:
                     logger.warning(f"Cross-post failed: {result.get('message', 'Unknown error')}")
 

@@ -1,5 +1,7 @@
 import os
 import sys
+import threading
+import time
 import webbrowser
 from uuid import UUID, uuid4
 
@@ -16,6 +18,9 @@ if root_dir not in sys.path:
     print("")
 
 from app.config import config
+from app.controllers.manager.base_manager import TaskQueueFullError
+from app.controllers.manager.memory_manager import InMemoryTaskManager
+from app.models import const
 from app.models.schema import (
     MaterialInfo,
     VideoAspect,
@@ -23,7 +28,8 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
-from app.services import llm, voice
+from app.services import state as sm
+from app.services import llm, material_policy, voice
 from app.services import task as tm
 from app.utils import utils
 
@@ -75,11 +81,72 @@ if "match_materials_to_script" not in st.session_state:
     st.session_state["match_materials_to_script"] = bool(
         config.app.get("match_materials_to_script", False)
     )
+if "material_locale" not in st.session_state:
+    st.session_state["material_locale"] = material_policy.normalize_material_locale(
+        config.app.get("material_locale", "auto")
+    )
+if "material_people_filter" not in st.session_state:
+    st.session_state["material_people_filter"] = (
+        material_policy.normalize_people_filter(
+            config.app.get("material_people_filter", "auto")
+        )
+    )
+if "material_source_mode" not in st.session_state:
+    saved_material_source_mode = config.app.get("material_source_mode", "fallback")
+    st.session_state["material_source_mode"] = (
+        saved_material_source_mode
+        if saved_material_source_mode in {"fallback", "mixed"}
+        else "fallback"
+    )
+if "video_sources" not in st.session_state:
+    saved_video_sources = config.app.get(
+        "video_sources", [config.app.get("video_source", "pexels")]
+    )
+    if isinstance(saved_video_sources, str):
+        saved_video_sources = [
+            source.strip()
+            for source in saved_video_sources.replace("，", ",").split(",")
+        ]
+    st.session_state["video_sources"] = [
+        source
+        for source in saved_video_sources
+        if source in {"pexels", "pixabay", "coverr", "local"}
+    ]
 if "ui_language" not in st.session_state:
     st.session_state["ui_language"] = config.ui.get("language", system_locale)
 if "local_video_materials" not in st.session_state:
     # 记住用户最近一次已经落盘的本地素材，避免仅修改文案后二次生成时丢失素材列表。
     st.session_state["local_video_materials"] = []
+
+
+@st.cache_resource
+def get_webui_task_manager(max_concurrent_tasks: int, max_queued_tasks: int):
+    return InMemoryTaskManager(
+        max_concurrent_tasks=max_concurrent_tasks,
+        max_queued_tasks=max_queued_tasks,
+    )
+
+
+def wait_for_webui_task(task_id, log_container, log_records, log_lock):
+    last_log_text = None
+    while True:
+        if not config.ui["hide_log"]:
+            with log_lock:
+                log_text = "\n".join(log_records)
+            if log_text != last_log_text:
+                with log_container:
+                    st.code(log_text)
+                last_log_text = log_text
+
+        task_state = sm.state.get_task(task_id)
+        if task_state and task_state.get("state") in {
+            const.TASK_STATE_COMPLETE,
+            const.TASK_STATE_FAILED,
+        }:
+            return task_state
+
+        time.sleep(0.5)
+
 
 # 加载语言文件
 locales = utils.load_locales(i18n_dir)
@@ -689,6 +756,15 @@ params = VideoParams(video_subject="")
 params.match_materials_to_script = bool(
     st.session_state.get("match_materials_to_script", False)
 )
+params.material_locale = material_policy.normalize_material_locale(
+    st.session_state.get("material_locale", config.app.get("material_locale", "auto"))
+)
+params.material_people_filter = material_policy.normalize_people_filter(
+    st.session_state.get(
+        "material_people_filter",
+        config.app.get("material_people_filter", "auto"),
+    )
+)
 uploaded_files = []
 uploaded_audio_file = None
 
@@ -762,17 +838,31 @@ with left_panel:
                     video_script_prompt=params.video_script_prompt,
                     custom_system_prompt=params.custom_system_prompt,
                 )
+                policy = material_policy.resolve_material_policy(
+                    video_language=params.video_language,
+                    video_subject=params.video_subject,
+                    video_script=script,
+                    material_locale=params.material_locale,
+                    people_filter=params.material_people_filter,
+                )
                 terms = llm.generate_terms(
                     params.video_subject,
                     script,
                     amount=8 if params.match_materials_to_script else 5,
                     match_script_order=params.match_materials_to_script,
+                    material_locale=(
+                        "china" if policy.is_china_context else policy.material_locale
+                    ),
+                    avoid_people=policy.avoid_people,
                 )
                 if "Error: " in script:
                     st.error(tr(script))
                 elif "Error: " in terms:
                     st.error(tr(terms))
                 else:
+                    terms = material_policy.adapt_search_terms_for_policy(
+                        terms, policy
+                    )
                     st.session_state["video_script"] = script
                     st.session_state["video_terms"] = ", ".join(terms)
         params.video_script = st.text_area(
@@ -784,15 +874,29 @@ with left_panel:
                 st.stop()
 
             with st.spinner(tr("Generating Video Keywords")):
+                policy = material_policy.resolve_material_policy(
+                    video_language=params.video_language,
+                    video_subject=params.video_subject,
+                    video_script=params.video_script,
+                    material_locale=params.material_locale,
+                    people_filter=params.material_people_filter,
+                )
                 terms = llm.generate_terms(
                     params.video_subject,
                     params.video_script,
                     amount=8 if params.match_materials_to_script else 5,
                     match_script_order=params.match_materials_to_script,
+                    material_locale=(
+                        "china" if policy.is_china_context else policy.material_locale
+                    ),
+                    avoid_people=policy.avoid_people,
                 )
                 if "Error: " in terms:
                     st.error(tr(terms))
                 else:
+                    terms = material_policy.adapt_search_terms_for_policy(
+                        terms, policy
+                    )
                     st.session_state["video_terms"] = ", ".join(terms)
 
         params.video_terms = st.text_area(
@@ -815,8 +919,15 @@ with middle_panel:
             (tr("Bilibili"), "bilibili"),
             (tr("Xiaohongshu"), "xiaohongshu"),
         ]
+        online_video_sources = [
+            (tr("Pexels"), "pexels"),
+            (tr("Pixabay"), "pixabay"),
+            (tr("Coverr"), "coverr"),
+        ]
 
         saved_video_source_name = config.app.get("video_source", "pexels")
+        if saved_video_source_name not in [v[1] for v in video_sources]:
+            saved_video_source_name = "pexels"
         saved_video_source_index = [v[1] for v in video_sources].index(
             saved_video_source_name
         )
@@ -829,6 +940,23 @@ with middle_panel:
         )
         params.video_source = video_sources[selected_index][1]
         config.app["video_source"] = params.video_source
+        if params.video_source == "local":
+            params.video_sources = [
+                "local",
+                *[
+                    source
+                    for source in st.session_state.get("video_sources", [])
+                    if source in {"pexels", "pixabay", "coverr"}
+                ],
+            ]
+        else:
+            params.video_sources = [
+                source
+                for source in st.session_state.get("video_sources", [])
+                if source in {"pexels", "pixabay", "coverr"}
+            ]
+            if params.video_source not in params.video_sources:
+                params.video_sources.insert(0, params.video_source)
 
         if params.video_source == "local":
             # Streamlit 的文件类型校验对扩展名大小写敏感，这里同时放行大小写两种形式。
@@ -906,6 +1034,109 @@ with middle_panel:
         )
 
         with st.expander(tr("Advanced Video Settings"), expanded=False):
+            material_source_mode_options = [
+                (tr("Fallback Material Source Mode"), "fallback"),
+                (tr("Mixed Material Source Mode"), "mixed"),
+            ]
+            saved_material_source_mode = st.session_state.get(
+                "material_source_mode", config.app.get("material_source_mode", "fallback")
+            )
+            if saved_material_source_mode not in {
+                item[1] for item in material_source_mode_options
+            }:
+                saved_material_source_mode = "fallback"
+            selected_material_source_mode = st.selectbox(
+                tr("Material Source Mode"),
+                options=range(len(material_source_mode_options)),
+                index=[item[1] for item in material_source_mode_options].index(
+                    saved_material_source_mode
+                ),
+                format_func=lambda x: material_source_mode_options[x][0],
+                key="material_source_mode_select",
+                help=tr("Material Source Mode Help"),
+            )
+            params.material_source_mode = material_source_mode_options[
+                selected_material_source_mode
+            ][1]
+            st.session_state["material_source_mode"] = params.material_source_mode
+            config.app["material_source_mode"] = params.material_source_mode
+
+            selected_online_sources = st.multiselect(
+                tr("Online Video Sources"),
+                options=[item[1] for item in online_video_sources],
+                default=[
+                    source
+                    for source in params.video_sources
+                    if source in {"pexels", "pixabay", "coverr"}
+                ],
+                format_func=dict((value, label) for label, value in online_video_sources).get,
+                help=tr("Online Video Sources Help"),
+            )
+            if params.video_source != "local" and params.video_source not in selected_online_sources:
+                selected_online_sources.insert(0, params.video_source)
+            params.video_sources = (
+                ["local", *selected_online_sources]
+                if params.video_source == "local"
+                else selected_online_sources
+            )
+            st.session_state["video_sources"] = params.video_sources
+            config.app["video_sources"] = params.video_sources
+
+            material_locale_options = [
+                (tr("Auto Material Locale"), "auto"),
+                (tr("Global Material Locale"), "global"),
+                (tr("China Material Locale"), "china"),
+            ]
+            saved_material_locale = material_policy.normalize_material_locale(
+                st.session_state.get(
+                    "material_locale",
+                    config.app.get("material_locale", "auto"),
+                )
+            )
+            selected_material_locale = st.selectbox(
+                tr("Material Locale"),
+                options=range(len(material_locale_options)),
+                index=[item[1] for item in material_locale_options].index(
+                    saved_material_locale
+                ),
+                format_func=lambda x: material_locale_options[x][0],
+                key="material_locale_select",
+                help=tr("Material Locale Help"),
+            )
+            params.material_locale = material_locale_options[
+                selected_material_locale
+            ][1]
+            st.session_state["material_locale"] = params.material_locale
+            config.app["material_locale"] = params.material_locale
+
+            people_filter_options = [
+                (tr("Auto People Filter"), "auto"),
+                (tr("Avoid People"), "avoid"),
+                (tr("Allow People"), "allow"),
+            ]
+            saved_people_filter = material_policy.normalize_people_filter(
+                st.session_state.get(
+                    "material_people_filter",
+                    config.app.get("material_people_filter", "auto"),
+                )
+            )
+            selected_people_filter = st.selectbox(
+                tr("People in Online Materials"),
+                options=range(len(people_filter_options)),
+                index=[item[1] for item in people_filter_options].index(
+                    saved_people_filter
+                ),
+                format_func=lambda x: people_filter_options[x][0],
+                key="material_people_filter_select",
+                help=tr("People in Online Materials Help"),
+            )
+            params.material_people_filter = people_filter_options[
+                selected_people_filter
+            ][1]
+            st.session_state[
+                "material_people_filter"
+            ] = params.material_people_filter
+            config.app["material_people_filter"] = params.material_people_filter
             # 默认关闭，避免影响老用户的随机素材体验。开启后只改变关键词和素材
             # 下载/拼接顺序，用于改善画面主题早于或晚于旁白的问题。
             params.match_materials_to_script = st.checkbox(
@@ -1452,17 +1683,19 @@ if start_button:
         scroll_to_bottom()
         st.stop()
 
-    if params.video_source == "pexels" and not config.app.get("pexels_api_keys", ""):
+    selected_material_sources = set(params.video_sources or [params.video_source])
+
+    if "pexels" in selected_material_sources and not config.app.get("pexels_api_keys", ""):
         st.error(tr("Please Enter the Pexels API Key"))
         scroll_to_bottom()
         st.stop()
 
-    if params.video_source == "pixabay" and not config.app.get("pixabay_api_keys", ""):
+    if "pixabay" in selected_material_sources and not config.app.get("pixabay_api_keys", ""):
         st.error(tr("Please Enter the Pixabay API Key"))
         scroll_to_bottom()
         st.stop()
 
-    if params.video_source == "coverr" and not config.app.get("coverr_api_keys", ""):
+    if "coverr" in selected_material_sources and not config.app.get("coverr_api_keys", ""):
         st.error(tr("Please Enter the Coverr API Key"))
         scroll_to_bottom()
         st.stop()
@@ -1500,7 +1733,7 @@ if start_button:
                 )
         # 将已上传并保存到本地的视频素材写入会话，供后续只改文案时直接复用。
         st.session_state["local_video_materials"] = persisted_local_materials
-    elif params.video_source == "local" and st.session_state["local_video_materials"]:
+    elif "local" in selected_material_sources and st.session_state["local_video_materials"]:
         # 当用户没有重新上传文件时，复用最近一次已经保存到磁盘的本地素材列表。
         params.video_materials = []
         for material in st.session_state["local_video_materials"]:
@@ -1513,24 +1746,45 @@ if start_button:
 
     log_container = st.empty()
     log_records = []
+    log_lock = threading.Lock()
 
     def log_received(msg):
         if config.ui["hide_log"]:
             return
-        with log_container:
+        with log_lock:
             log_records.append(msg)
-            st.code("\n".join(log_records))
 
-    logger.add(log_received)
+    log_handler_id = logger.add(log_received)
 
-    st.toast(tr("Generating Video"))
-    logger.info(tr("Start Generating Video"))
-    logger.info(utils.to_json(params))
-    scroll_to_bottom()
+    try:
+        st.toast(tr("Generating Video"))
+        logger.info(tr("Start Generating Video"))
+        logger.info(utils.to_json(params))
+        scroll_to_bottom()
 
-    result = tm.start(task_id=task_id, params=params)
+        sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=0)
+        webui_task_manager = get_webui_task_manager(
+            max_concurrent_tasks=config.app.get("max_concurrent_tasks", 5),
+            max_queued_tasks=config.app.get("max_queued_tasks", 100),
+        )
+        webui_task_manager.add_task(tm.start, task_id=task_id, params=params)
+        result = wait_for_webui_task(task_id, log_container, log_records, log_lock)
+    except TaskQueueFullError as e:
+        sm.state.delete_task(task_id)
+        st.error(str(e))
+        logger.error(str(e))
+        scroll_to_bottom()
+        st.stop()
+    finally:
+        try:
+            logger.remove(log_handler_id)
+        except ValueError:
+            pass
+
     if not result or "videos" not in result:
         st.error(tr("Video Generation Failed"))
+        if result and result.get("error_message"):
+            st.error(result.get("error_message"))
         logger.error(tr("Video Generation Failed"))
         scroll_to_bottom()
         st.stop()

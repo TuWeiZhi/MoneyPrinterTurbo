@@ -539,6 +539,7 @@ def combine_videos(
 
     # 兼容 API 直接调用时未传转场模式的情况，避免后续访问 .value 时崩溃。
     transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+    concat_mode_value = getattr(video_concat_mode, "value", video_concat_mode)
     output_dir = os.path.dirname(combined_video_path)
 
     aspect = VideoAspect(video_aspect)
@@ -574,7 +575,7 @@ def combine_videos(
                 )
 
             start_time = end_time
-            if video_concat_mode.value == VideoConcatMode.sequential.value:
+            if concat_mode_value == VideoConcatMode.sequential.value:
                 break
 
     subclipped_items = _prioritize_unique_source_clips(
@@ -596,6 +597,7 @@ def combine_videos(
             f"remaining: {audio_duration - video_duration:.2f}s"
         )
         
+        clip = None
         try:
             clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
                 subclipped_item.start_time, subclipped_item.end_time
@@ -659,7 +661,6 @@ def combine_videos(
 
             # Store clip duration before closing
             clip_duration_saved = clip.duration
-            close_clip(clip)
 
             processed_clips.append(
                 SubClippedVideoClip(
@@ -674,7 +675,12 @@ def combine_videos(
             
         except Exception as e:
             logger.error(f"failed to process clip: {str(e)}")
+        finally:
+            close_clip(clip)
     
+    if not processed_clips:
+        raise ValueError("no clips available for merging")
+
     # loop processed clips until the video duration matches or exceeds the audio duration.
     if video_duration < audio_duration:
         logger.warning(f"video duration ({video_duration:.2f}s) is shorter than audio duration ({audio_duration:.2f}s), looping clips to match audio length.")
@@ -688,10 +694,7 @@ def combine_videos(
      
     # merge video clips progressively, avoid loading all videos at once to avoid memory overflow
     logger.info("starting clip merging process")
-    if not processed_clips:
-        logger.warning("no clips available for merging")
-        return combined_video_path
-    
+
     # if there is only one clip, use it directly
     if len(processed_clips) == 1:
         logger.info("using single clip directly")
@@ -1052,60 +1055,78 @@ def generate_video(
             _clip = _clip.with_position(("center", "center"))
         return _clip
 
-    video_clip = _open_video_clip_quietly(video_path)
-    audio_clip = AudioFileClip(audio_path).with_effects(
-        [afx.MultiplyVolume(params.voice_volume)]
-    )
+    clips_to_close = []
 
-    def make_textclip(text):
-        return TextClip(
-            text=text,
-            font=font_path,
-            font_size=params.font_size,
+    def remember_clip(clip):
+        if clip is not None:
+            clips_to_close.append(clip)
+        return clip
+
+    try:
+        video_clip = remember_clip(_open_video_clip_quietly(video_path))
+        raw_audio_clip = remember_clip(AudioFileClip(audio_path))
+        audio_clip = remember_clip(
+            raw_audio_clip.with_effects([afx.MultiplyVolume(params.voice_volume)])
         )
 
-    if subtitle_path and os.path.exists(subtitle_path):
-        sub = SubtitlesClip(
-            subtitles=subtitle_path, encoding="utf-8", make_textclip=make_textclip
-        )
-        text_clips = []
-        for item in sub.subtitles:
-            clip = create_text_clip(subtitle_item=item)
-            text_clips.append(clip)
-        video_clip = CompositeVideoClip([video_clip, *text_clips])
-
-    bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
-    if bgm_file:
-        try:
-            bgm_clip = AudioFileClip(bgm_file).with_effects(
-                [
-                    afx.MultiplyVolume(params.bgm_volume),
-                    afx.AudioFadeOut(3),
-                    afx.AudioLoop(duration=video_clip.duration),
-                ]
+        def make_textclip(text):
+            return TextClip(
+                text=text,
+                font=font_path,
+                font_size=params.font_size,
             )
-            audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
-        except Exception as e:
-            logger.error(f"failed to add bgm: {str(e)}")
 
-    video_clip = video_clip.with_audio(audio_clip)
-    # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
-    # 这样可以减少不同运行环境，尤其是 Docker 环境中再次重采样带来的音质波动。
-    output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
-    _write_videofile_with_codec_fallback(
-        video_clip,
-        output_file=output_file,
-        codec=_get_configured_video_codec(),
-        audio_codec=audio_codec,
-        audio_fps=output_audio_fps,
-        audio_bitrate=audio_bitrate,
-        temp_audiofile_path=_get_temp_audio_dir(output_dir),
-        threads=params.n_threads or 2,
-        logger=None,
-        fps=fps,
-    )
-    video_clip.close()
-    del video_clip
+        if subtitle_path and os.path.exists(subtitle_path):
+            sub = SubtitlesClip(
+                subtitles=subtitle_path, encoding="utf-8", make_textclip=make_textclip
+            )
+            text_clips = []
+            for item in sub.subtitles:
+                clip = remember_clip(create_text_clip(subtitle_item=item))
+                text_clips.append(clip)
+            video_clip = remember_clip(CompositeVideoClip([video_clip, *text_clips]))
+
+        bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
+        if bgm_file:
+            try:
+                raw_bgm_clip = remember_clip(AudioFileClip(bgm_file))
+                bgm_clip = remember_clip(
+                    raw_bgm_clip.with_effects(
+                        [
+                            afx.MultiplyVolume(params.bgm_volume),
+                            afx.AudioFadeOut(3),
+                            afx.AudioLoop(duration=video_clip.duration),
+                        ]
+                    )
+                )
+                audio_clip = remember_clip(CompositeAudioClip([audio_clip, bgm_clip]))
+            except Exception as e:
+                logger.error(f"failed to add bgm: {str(e)}")
+
+        video_clip = remember_clip(video_clip.with_audio(audio_clip))
+        # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
+        # 这样可以减少不同运行环境，尤其是 Docker 环境中再次重采样带来的音质波动。
+        output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
+        _write_videofile_with_codec_fallback(
+            video_clip,
+            output_file=output_file,
+            codec=_get_configured_video_codec(),
+            audio_codec=audio_codec,
+            audio_fps=output_audio_fps,
+            audio_bitrate=audio_bitrate,
+            temp_audiofile_path=_get_temp_audio_dir(output_dir),
+            threads=params.n_threads or 2,
+            logger=None,
+            fps=fps,
+        )
+    finally:
+        closed_clip_ids = set()
+        for clip in reversed(clips_to_close):
+            clip_id = id(clip)
+            if clip_id in closed_clip_ids:
+                continue
+            closed_clip_ids.add(clip_id)
+            close_clip(clip)
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):

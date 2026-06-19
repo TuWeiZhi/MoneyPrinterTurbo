@@ -9,6 +9,7 @@ from unittest.mock import patch
 # add project root to python path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from app.config import config
 from app.services import task as tm
 from app.models.schema import MaterialInfo, VideoParams
 from app.utils import utils
@@ -67,14 +68,49 @@ class TestTaskService(unittest.TestCase):
         with patch.object(tm.llm, "generate_terms", return_value=["city", "train"]) as generate:
             result = tm.generate_terms("task-id", params, "先城市，再地铁")
 
-        self.assertEqual(result, ["city", "train"])
+        self.assertEqual(result, ["city no people", "train no people"])
         generate.assert_called_once_with(
             video_subject="城市通勤",
             video_script="先城市，再地铁",
             amount=8,
             match_script_order=True,
+            material_locale="china",
+            avoid_people=True,
         )
     
+    def test_generate_terms_avoids_people_for_chinese_context(self):
+        params = VideoParams(
+            video_subject="\u4e0a\u6d77\u804c\u573a\u6548\u7387",
+            video_script="",
+            video_language="zh-CN",
+            material_locale="auto",
+            material_people_filter="auto",
+        )
+
+        with patch.object(
+            tm.llm,
+            "generate_terms",
+            return_value=["businessman office", "city skyline"],
+        ) as generate:
+            result = tm.generate_terms(
+                "task-id",
+                params,
+                "\u4e0a\u6d77\u4e0a\u73ed\u65cf\u7684\u4e00\u5929",
+            )
+
+        self.assertEqual(
+            result,
+            ["office desk no people", "city skyline no people"],
+        )
+        generate.assert_called_once_with(
+            video_subject="\u4e0a\u6d77\u804c\u573a\u6548\u7387",
+            video_script="\u4e0a\u6d77\u4e0a\u73ed\u65cf\u7684\u4e00\u5929",
+            amount=5,
+            match_script_order=False,
+            material_locale="china",
+            avoid_people=True,
+        )
+
     def test_generate_audio_uses_custom_file_inside_task_directory(self):
         task_id = "test-custom-audio-safe"
         task_dir = utils.task_dir(task_id)
@@ -161,7 +197,155 @@ class TestTaskService(unittest.TestCase):
         self.assertIsNone(audio_duration)
         self.assertIsNone(result_sub_maker)
         tts.assert_not_called()
-        update_task.assert_called_with(task_id, state=tm.const.TASK_STATE_FAILED)
+        update_task.assert_called_with(
+            task_id,
+            state=tm.const.TASK_STATE_FAILED,
+            progress=0,
+            error_message="custom audio file does not exist or is not a file",
+            failed_stage="audio",
+        )
+
+    def test_generate_audio_forwards_voice_volume_to_tts(self):
+        params = VideoParams(
+            video_subject="tts",
+            video_script="",
+            voice_name="zh-CN-XiaoxiaoNeural-Female",
+            voice_volume=1.8,
+            voice_rate=1.1,
+        )
+
+        with (
+            patch.object(tm.voice, "parse_voice_name", return_value="voice") as parse,
+            patch.object(tm.voice, "tts", return_value=object()) as tts,
+            patch.object(tm.voice, "get_audio_duration", return_value=4),
+        ):
+            audio_file, audio_duration, sub_maker = tm.generate_audio(
+                "test-tts-volume", params, "script"
+            )
+
+        self.assertTrue(audio_file.endswith("audio.mp3"))
+        self.assertEqual(audio_duration, 4)
+        self.assertIsNotNone(sub_maker)
+        parse.assert_called_once_with("zh-CN-XiaoxiaoNeural-Female")
+        self.assertEqual(tts.call_args.kwargs["voice_volume"], 1.8)
+
+    def test_generate_subtitle_allows_custom_audio_with_whisper(self):
+        original_app_config = dict(config.app)
+        config.app["subtitle_provider"] = "whisper"
+        try:
+            with (
+                patch.object(tm.subtitle, "create") as create,
+                patch.object(tm.subtitle, "correct") as correct,
+                patch.object(tm.subtitle, "file_to_subtitles", return_value=[(1, "00:00:00,000 --> 00:00:01,000", "hello")]),
+            ):
+                subtitle_path = tm.generate_subtitle(
+                    "test-whisper-custom-audio",
+                    VideoParams(
+                        video_subject="custom audio",
+                        video_script="hello",
+                        custom_audio_file="custom.mp3",
+                        subtitle_enabled=True,
+                    ),
+                    "hello",
+                    sub_maker=None,
+                    audio_file="custom.mp3",
+                )
+        finally:
+            config.app.clear()
+            config.app.update(original_app_config)
+
+        self.assertTrue(subtitle_path.endswith("subtitle.srt"))
+        create.assert_called_once_with(audio_file="custom.mp3", subtitle_file=subtitle_path)
+        correct.assert_called_once_with(subtitle_file=subtitle_path, video_script="hello")
+
+    def test_get_video_materials_forwards_multi_source_options(self):
+        params = VideoParams(
+            video_subject="city",
+            video_script="city commute",
+            video_terms=["city"],
+            video_source="pexels",
+            video_sources=["pixabay", "pexels"],
+            material_source_mode="mixed",
+            material_locale="global",
+        )
+
+        with patch.object(
+            tm.material, "download_videos", return_value=["/tmp/video.mp4"]
+        ) as download:
+            result = tm.get_video_materials(
+                "task-multi-source", params, ["city"], audio_duration=12
+            )
+
+        self.assertEqual(result, ["/tmp/video.mp4"])
+        self.assertEqual(download.call_args.kwargs["sources"], ["pixabay", "pexels"])
+        self.assertEqual(download.call_args.kwargs["source_mode"], "mixed")
+        self.assertEqual(download.call_args.kwargs["audio_duration"], 12)
+
+    def test_get_video_materials_uses_local_first_then_online_fallback(self):
+        params = VideoParams(
+            video_subject="city",
+            video_script="city commute",
+            video_terms=["city"],
+            video_source="pixabay",
+            video_sources=["local", "pixabay"],
+            material_source_mode="fallback",
+            video_clip_duration=3,
+            material_locale="global",
+            video_materials=[
+                MaterialInfo(provider="local", url="local-a.mp4", duration=0),
+                MaterialInfo(provider="local", url="local-b.mp4", duration=0),
+            ],
+        )
+        local_materials = [
+            MaterialInfo(provider="local", url="/tmp/local-a.mp4", duration=0),
+            MaterialInfo(provider="local", url="/tmp/local-b.mp4", duration=0),
+        ]
+
+        with (
+            patch.object(tm.video, "preprocess_video", return_value=local_materials),
+            patch.object(tm.material, "download_videos", return_value=["/tmp/online.mp4"]) as download,
+        ):
+            result = tm.get_video_materials(
+                "task-local-online", params, ["city"], audio_duration=10
+            )
+
+        self.assertEqual(
+            result, ["/tmp/local-a.mp4", "/tmp/local-b.mp4", "/tmp/online.mp4"]
+        )
+        self.assertEqual(download.call_args.kwargs["sources"], ["pixabay"])
+        self.assertEqual(download.call_args.kwargs["source_mode"], "fallback")
+        self.assertEqual(download.call_args.kwargs["audio_duration"], 4)
+
+    def test_get_video_materials_returns_local_when_fallback_local_is_enough(self):
+        params = VideoParams(
+            video_subject="city",
+            video_script="city commute",
+            video_terms=["city"],
+            video_source="pixabay",
+            video_sources=["local", "pixabay"],
+            material_source_mode="fallback",
+            video_clip_duration=5,
+            material_locale="global",
+            video_materials=[
+                MaterialInfo(provider="local", url="local-a.mp4", duration=0),
+                MaterialInfo(provider="local", url="local-b.mp4", duration=0),
+            ],
+        )
+        local_materials = [
+            MaterialInfo(provider="local", url="/tmp/local-a.mp4", duration=0),
+            MaterialInfo(provider="local", url="/tmp/local-b.mp4", duration=0),
+        ]
+
+        with (
+            patch.object(tm.video, "preprocess_video", return_value=local_materials),
+            patch.object(tm.material, "download_videos") as download,
+        ):
+            result = tm.get_video_materials(
+                "task-local-enough", params, ["city"], audio_duration=8
+            )
+
+        self.assertEqual(result, ["/tmp/local-a.mp4", "/tmp/local-b.mp4"])
+        download.assert_not_called()
 
     @unittest.skipUnless(
         RUN_INTEGRATION_TESTS,

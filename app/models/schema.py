@@ -1,9 +1,10 @@
 import warnings
 from enum import Enum
+import re
 from typing import Any, List, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.config import config
 
@@ -48,6 +49,119 @@ class _Config:
     arbitrary_types_allowed = True
 
 
+_HEX_COLOR_PATTERN = re.compile(r"^#[0-9a-fA-F]{6}$")
+_VIDEO_SOURCES = {"pexels", "pixabay", "coverr", "local"}
+_BGM_TYPES = {"", "random", "custom"}
+_SUBTITLE_POSITIONS = {"top", "center", "bottom", "custom"}
+_MATERIAL_LOCALES = {"auto", "global", "china"}
+_MATERIAL_PEOPLE_FILTERS = {"auto", "avoid", "allow"}
+_MATERIAL_SOURCE_MODES = {"fallback", "mixed"}
+
+
+class ValidatedBaseModel(BaseModel):
+    @field_validator("video_source", check_fields=False)
+    @classmethod
+    def validate_video_source(cls, value):
+        if value is None:
+            return value
+        if value not in _VIDEO_SOURCES:
+            raise ValueError(
+                f"video_source must be one of {sorted(_VIDEO_SOURCES)}"
+            )
+        return value
+
+    @field_validator("bgm_type", check_fields=False)
+    @classmethod
+    def validate_bgm_type(cls, value):
+        if value is None:
+            return value
+        if value not in _BGM_TYPES:
+            raise ValueError(f"bgm_type must be one of {sorted(_BGM_TYPES)}")
+        return value
+
+    @field_validator("subtitle_position", check_fields=False)
+    @classmethod
+    def validate_subtitle_position(cls, value):
+        if value is None:
+            return value
+        if value not in _SUBTITLE_POSITIONS:
+            raise ValueError(
+                f"subtitle_position must be one of {sorted(_SUBTITLE_POSITIONS)}"
+            )
+        return value
+
+    @field_validator("text_fore_color", "stroke_color", check_fields=False)
+    @classmethod
+    def validate_hex_color(cls, value):
+        if value is None:
+            return value
+        if not _HEX_COLOR_PATTERN.match(value):
+            raise ValueError("color must use #RRGGBB format")
+        return value
+
+    @field_validator("text_background_color", check_fields=False)
+    @classmethod
+    def validate_text_background_color(cls, value):
+        if isinstance(value, bool) or value is None:
+            return value
+        if not _HEX_COLOR_PATTERN.match(value):
+            raise ValueError("text_background_color must be a boolean or #RRGGBB")
+        return value
+
+    @field_validator("material_locale", check_fields=False)
+    @classmethod
+    def validate_material_locale(cls, value):
+        if value is None:
+            return "auto"
+        if value not in _MATERIAL_LOCALES:
+            raise ValueError(
+                f"material_locale must be one of {sorted(_MATERIAL_LOCALES)}"
+            )
+        return value
+
+    @field_validator("material_people_filter", check_fields=False)
+    @classmethod
+    def validate_material_people_filter(cls, value):
+        if value is None:
+            return "auto"
+        if value not in _MATERIAL_PEOPLE_FILTERS:
+            raise ValueError(
+                "material_people_filter must be one of "
+                f"{sorted(_MATERIAL_PEOPLE_FILTERS)}"
+            )
+        return value
+
+    @field_validator("material_source_mode", check_fields=False, mode="before")
+    @classmethod
+    def validate_material_source_mode(cls, value):
+        if value is None:
+            return "fallback"
+        if value not in _MATERIAL_SOURCE_MODES:
+            raise ValueError(
+                f"material_source_mode must be one of {sorted(_MATERIAL_SOURCE_MODES)}"
+            )
+        return value
+
+    @field_validator("video_sources", check_fields=False, mode="before")
+    @classmethod
+    def validate_video_sources(cls, value):
+        if value is None:
+            return value
+        if isinstance(value, str):
+            value = [source.strip() for source in re.split(r"[,，]", value)]
+        sources = []
+        for source in value:
+            if not source:
+                continue
+            if source not in _VIDEO_SOURCES:
+                raise ValueError(
+                    f"video_sources must only contain {sorted(_VIDEO_SOURCES)}"
+                )
+            if source not in sources:
+                sources.append(source)
+        return sources or None
+
+
 @pydantic.dataclasses.dataclass(config=_Config)
 class MaterialInfo:
     provider: str = "pexels"
@@ -55,7 +169,7 @@ class MaterialInfo:
     duration: int = 0
 
 
-class VideoParams(BaseModel):
+class VideoParams(ValidatedBaseModel):
     """
     {
       "video_subject": "",
@@ -76,72 +190,76 @@ class VideoParams(BaseModel):
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
     video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
     video_transition_mode: Optional[VideoTransitionMode] = None
-    video_clip_duration: Optional[int] = 5
+    video_clip_duration: int = Field(default=5, ge=1, le=60)
     match_materials_to_script: bool = False
-    video_count: Optional[int] = 1
+    video_count: int = Field(default=1, ge=1, le=10)
 
     video_source: Optional[str] = "pexels"
+    video_sources: Optional[List[str]] = None
+    material_source_mode: str = "fallback"
+    material_locale: str = "auto"
+    material_people_filter: str = "auto"
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
     
-    custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore video_script and disable subtitle
+    custom_audio_file: Optional[str] = None  # Custom audio file path
     video_language: Optional[str] = ""  # auto detect
 
     voice_name: Optional[str] = ""
-    voice_volume: Optional[float] = 1.0
-    voice_rate: Optional[float] = 1.0
+    voice_volume: float = Field(default=1.0, ge=0.0, le=5.0)
+    voice_rate: float = Field(default=1.0, ge=0.25, le=4.0)
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
-    bgm_volume: Optional[float] = 0.2
+    bgm_volume: float = Field(default=0.2, ge=0.0, le=5.0)
 
-    subtitle_enabled: Optional[bool] = True
+    subtitle_enabled: bool = True
     subtitle_position: Optional[str] = config.ui.get("subtitle_position", "bottom")  # top, bottom, center, custom
-    custom_position: float = config.ui.get("custom_position", 70.0)
+    custom_position: float = Field(default=config.ui.get("custom_position", 70.0), ge=0.0, le=100.0)
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = True
     rounded_subtitle_background: bool = False
 
-    font_size: int = 60
+    font_size: int = Field(default=60, ge=12, le=200)
     stroke_color: Optional[str] = "#000000"
-    stroke_width: float = 1.5
-    n_threads: Optional[int] = 2
+    stroke_width: float = Field(default=1.5, ge=0.0, le=20.0)
+    n_threads: int = Field(default=2, ge=1, le=16)
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
 
 
-class SubtitleRequest(BaseModel):
+class SubtitleRequest(ValidatedBaseModel):
     video_script: str
     video_language: Optional[str] = ""
     voice_name: Optional[str] = "zh-CN-XiaoxiaoNeural-Female"
-    voice_volume: Optional[float] = 1.0
-    voice_rate: Optional[float] = 1.2
+    voice_volume: float = Field(default=1.0, ge=0.0, le=5.0)
+    voice_rate: float = Field(default=1.2, ge=0.25, le=4.0)
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
-    bgm_volume: Optional[float] = 0.2
+    bgm_volume: float = Field(default=0.2, ge=0.0, le=5.0)
     subtitle_position: Optional[str] = config.ui.get("subtitle_position", "bottom")
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = True
     rounded_subtitle_background: bool = False
-    font_size: int = 60
+    font_size: int = Field(default=60, ge=12, le=200)
     stroke_color: Optional[str] = "#000000"
-    stroke_width: float = 1.5
+    stroke_width: float = Field(default=1.5, ge=0.0, le=20.0)
     video_source: Optional[str] = "local"
-    subtitle_enabled: Optional[str] = "true"
+    subtitle_enabled: bool = True
 
 
-class AudioRequest(BaseModel):
+class AudioRequest(ValidatedBaseModel):
     video_script: str
     video_language: Optional[str] = ""
     voice_name: Optional[str] = "zh-CN-XiaoxiaoNeural-Female"
-    voice_volume: Optional[float] = 1.0
-    voice_rate: Optional[float] = 1.2
+    voice_volume: float = Field(default=1.0, ge=0.0, le=5.0)
+    voice_rate: float = Field(default=1.2, ge=0.25, le=4.0)
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
-    bgm_volume: Optional[float] = 0.2
+    bgm_volume: float = Field(default=0.2, ge=0.0, le=5.0)
     video_source: Optional[str] = "local"
 
 
@@ -177,6 +295,10 @@ class VideoTermsParams:
         "春天的花海，如诗如画般展现在眼前。万物复苏的季节里，大地披上了一袭绚丽多彩的盛装。金黄的迎春、粉嫩的樱花、洁白的梨花、艳丽的郁金香……"
     )
     amount: Optional[int] = 5
+    video_language: Optional[str] = ""
+    match_script_order: bool = False
+    material_locale: str = "auto"
+    material_people_filter: str = "auto"
 
 
 class VideoSocialMetadataParams:

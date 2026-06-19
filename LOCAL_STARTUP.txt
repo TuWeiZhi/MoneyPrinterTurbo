@@ -1,0 +1,74 @@
+MoneyPrinterTurbo 本地启动说明
+==============================
+
+用途
+----
+这个文件只记录本地手动启动 WebUI 的命令，以及 uv 虚拟环境的常用管理方式。
+它不是脚本，不会自动执行任何操作。
+
+
+一、首次准备虚拟环境
+--------------------
+在项目根目录执行：
+
+    uv python install 3.11
+    uv sync --frozen
+
+说明：
+- `uv python install 3.11` 用于安装项目推荐的 Python 3.11。
+- `uv sync --frozen` 会根据 `uv.lock` 创建/更新 `.venv`，并安装固定版本依赖。
+- 以后依赖没变化时，不需要每次启动前都执行这两个命令。
+
+
+二、启动 WebUI
+--------------
+在项目根目录执行：
+
+    uv run streamlit run ./webui/Main.py --server.address=0.0.0.0 --server.port=8501 --browser.gatherUsageStats=False --server.showEmailPrompt=False
+
+访问方式：
+- 本机访问：`http://127.0.0.1:8501`
+- 局域网访问：`http://你的电脑局域网IP:8501`
+
+说明：
+- `--server.address=0.0.0.0` 表示监听所有网卡，所以局域网内其他设备也可以访问。
+- 浏览器里不要访问 `http://0.0.0.0:8501`，本机用 `127.0.0.1`，其他设备用你的局域网 IP。
+- 如果局域网访问失败，优先检查 Windows 防火墙是否放行 `8501` 端口。
+
+
+三、虚拟环境怎么管理
+--------------------
+查看当前项目 Python：
+
+    uv run python --version
+
+检查关键依赖是否可用：
+
+    uv run python -c "import streamlit, fastapi, moviepy, loguru; print('ok')"
+
+依赖损坏或缺失时，重新同步：
+
+    uv sync --frozen
+
+手动激活虚拟环境：
+
+    .\.venv\Scripts\Activate.ps1
+
+退出虚拟环境：
+
+    deactivate
+
+说明：
+- 平时推荐直接用 `uv run ...`，不需要手动激活 `.venv`。
+- `.venv` 是本地生成目录，已经被 `.gitignore` 忽略，不需要提交。
+- 如果想彻底重建环境，可以先删除 `.venv`，再执行 `uv sync --frozen`。
+
+
+四、API 服务是否需要启动
+------------------------
+只用 WebUI 时，不需要启动 API。
+
+如果你需要 HTTP API，例如访问 `http://127.0.0.1:8080/docs`，再单独开一个终端执行：
+
+    uv run python main.py
+

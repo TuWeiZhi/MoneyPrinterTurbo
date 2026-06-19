@@ -683,9 +683,9 @@ def generate_script(
         response = response.replace("*", "")
         response = response.replace("#", "")
 
-        # Remove markdown syntax
-        response = re.sub(r"\[.*\]", "", response)
-        response = re.sub(r"\(.*\)", "", response)
+        # Keep normal bracketed prose, only unwrap markdown links/images.
+        response = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", response)
+        response = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", response)
 
         # Split the script into paragraphs
         paragraphs = response.split("\n\n")
@@ -743,6 +743,8 @@ def generate_terms(
     video_script: str,
     amount: int = 5,
     match_script_order: bool = False,
+    material_locale: str = "auto",
+    avoid_people: bool = False,
 ) -> List[str]:
     if match_script_order:
         goal = (
@@ -775,6 +777,18 @@ def generate_terms(
             '"search term 4", "search term 5"]'
         )
 
+    material_constraints = ""
+    if avoid_people:
+        material_constraints += """
+7. prefer non-human B-roll: places, objects, products, food, hands, screens, streets, buildings, nature, tools, vehicles, interiors, and close-up details.
+8. avoid search terms that are likely to return faces or western lifestyle actors: do not use people, person, man, woman, family, face, portrait, smiling, businessman, businesswoman, crowd, student, or customer.
+""".rstrip()
+    if material_locale == "china":
+        material_constraints += """
+9. when the subject or script is China-specific, prefer neutral China-compatible visual context such as city streets, transit, storefronts, food, apartment blocks, phones, office desks, and product close-ups.
+10. do not invent a Chinese city or landmark unless it appears in the subject or script.
+""".rstrip()
+
     prompt = f"""
 # Role: Video Search Terms Generator
 
@@ -788,6 +802,7 @@ def generate_terms(
 4. the search terms must be related to the subject of the video.
 5. reply with english search terms only.
 {ordering_rule}
+{material_constraints}
 
 ## Output Example:
 {output_example}
@@ -803,7 +818,8 @@ Please note that you must use English for generating video search terms; Chinese
 """.strip()
 
     logger.info(
-        f"subject: {video_subject}, match_script_order: {match_script_order}"
+        f"subject: {video_subject}, match_script_order: {match_script_order}, "
+        f"material_locale: {material_locale}, avoid_people: {avoid_people}"
     )
 
     search_terms = []

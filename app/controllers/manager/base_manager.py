@@ -22,6 +22,7 @@ class TaskManager:
     def add_task(self, func: Callable, *args: Any, **kwargs: Any):
         with self.lock:
             if self.current_tasks < self.max_concurrent_tasks:
+                self.current_tasks += 1
                 logger.info(
                     f"add task: {func.__name__}, current_tasks: {self.current_tasks}"
                 )
@@ -51,9 +52,9 @@ class TaskManager:
 
     def run_task(self, func: Callable, *args: Any, **kwargs: Any):
         try:
-            with self.lock:
-                self.current_tasks += 1
             func(*args, **kwargs)  # call the function here, passing *args and **kwargs.
+        except Exception:
+            logger.exception(f"task failed unexpectedly: {func.__name__}")
         finally:
             self.task_done()
 
@@ -64,6 +65,9 @@ class TaskManager:
                 and not self.is_queue_empty()
             ):
                 task_info = self.dequeue()
+                if not task_info:
+                    return
+                self.current_tasks += 1
                 func = task_info["func"]
                 args = task_info.get("args", ())
                 kwargs = task_info.get("kwargs", {})
@@ -71,7 +75,7 @@ class TaskManager:
 
     def task_done(self):
         with self.lock:
-            self.current_tasks -= 1
+            self.current_tasks = max(0, self.current_tasks - 1)
         self.check_queue()
 
     def enqueue(self, task: Dict):

@@ -197,6 +197,38 @@ def similarity(a, b):
     return 1 - (distance / max_length)
 
 
+def _srt_timestamp_to_seconds(timestamp: str) -> float:
+    hours, minutes, rest = timestamp.split(":")
+    seconds, milliseconds = rest.split(",")
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + int(seconds)
+        + int(milliseconds) / 1000
+    )
+
+
+def _split_srt_time_range(time_range: str) -> tuple[float, float]:
+    start, end = time_range.split(" --> ")
+    return _srt_timestamp_to_seconds(start), _srt_timestamp_to_seconds(end)
+
+
+def _estimate_next_time_range(new_subtitle_items) -> str:
+    if not new_subtitle_items:
+        start_seconds = 0.0
+        duration = 2.0
+    else:
+        last_start, last_end = _split_srt_time_range(new_subtitle_items[-1][1])
+        start_seconds = last_end
+        duration = max(1.0, min(4.0, last_end - last_start or 2.0))
+
+    end_seconds = start_seconds + duration
+    return (
+        f"{utils.time_convert_seconds_to_hmsm(start_seconds)} --> "
+        f"{utils.time_convert_seconds_to_hmsm(end_seconds)}"
+    )
+
+
 def correct(subtitle_file, video_script):
     subtitle_items = file_to_subtitles(subtitle_file)
     normalized_script = utils.normalize_script_for_subtitle_matching(video_script)
@@ -276,7 +308,7 @@ def correct(subtitle_file, video_script):
             new_subtitle_items.append(
                 (
                     len(new_subtitle_items) + 1,
-                    "00:00:00,000 --> 00:00:00,000",
+                    _estimate_next_time_range(new_subtitle_items),
                     script_lines[script_index],
                 )
             )
